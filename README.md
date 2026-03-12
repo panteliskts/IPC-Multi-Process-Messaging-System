@@ -1,238 +1,232 @@
-# Εργασία 1
-## Σύστημα Ανταλλαγής Μηνυμάτων μεταξύ Διεργασιών (IPC)
+# IPC Multi-Process Messaging System
 
-**Μάθημα:** Λειτουργικά Συστήματα  
-**Εξάμηνο:** Χειμερινό 2024-2025
+A multi-process messaging system in C using **POSIX shared memory** and **named semaphores**, allowing multiple independent processes to join named dialogs and exchange messages with guaranteed exactly-once delivery per participant.
 
----
-
-## 1. Εισαγωγή
- Στην εργασία υλοποιήθηκε ένα σύστημα ανταλλαγής/διάχυσης μηνυμάτων μεταξύ διεργασιών χρησιμοποιώντας μηχανισμούς Διαδιεργασιακής Επικοινωνίας (Inter-Process Communication - IPC). Το σύστημα επιτρέπει σε πολλαπλές διεργασίες να συμμετέχουν σε "διαλόγους" και να ανταλλάσσουν μηνύματα μεταξύ τους.
-
-### 1.1 Στόχοι της Εργασίας
-
-- Υλοποίηση συστήματος IPC με χρήση κοινόχρηστης μνήμης (shared memory)
-- Συγχρονισμός πρόσβασης με σημαφόρους (semaphores)
-- Υποστήριξη πολλαπλών διαλόγων και διεργασιών
-- Εγγύηση παράδοσης μηνυμάτων σε όλους τους συμμετέχοντες
+> Built as part of the Operating Systems course (K22) at the National and Kapodistrian University of Athens (NKUA), 2024–2025.
 
 ---
 
-## 2. Αρχιτεκτονική Συστήματος
+## Overview
 
-### 2.1 Δομές Δεδομένων
+Multiple processes can run simultaneously and communicate through a shared memory region mapped into each process's address space. A named semaphore provides mutual exclusion, ensuring data integrity when multiple processes read and write concurrently.
 
-Το σύστημα χρησιμοποιεί τρεις βασικές δομές δεδομένων:
+Key properties:
+- **Exactly-once delivery** — every message is delivered to every participant exactly once, then automatically discarded
+- **Non-blocking I/O** — processes poll for new messages using `select()` with a 100ms timeout, so the terminal stays responsive while waiting
+- **Graceful shutdown** — `SIGINT` (Ctrl+C) is handled cleanly, releasing all shared resources
+- **Automatic cleanup** — shared memory and semaphores are unlinked when the last participant exits
 
-#### Message (Μήνυμα)
+---
+
+## Architecture
+
+### Data Structures
+
+**`Message`** — a single message in the shared message pool:
 ```c
 typedef struct {
-    int dialog_id;              // Αναγνωριστικό διαλόγου
-    pid_t sender_pid;           // PID αποστολέα
-    char payload[256];          // Περιεχόμενο μηνύματος
-    int read_count;             // Αριθμός διεργασιών που διάβασαν
-    pid_t readers[10];          // PIDs διεργασιών που διάβασαν
-    int valid;                  // Εγκυρότητα μηνύματος
+    int dialog_id;       // Which dialog this message belongs to
+    pid_t sender_pid;    // PID of the sender
+    char payload[256];   // Message content (max 256 chars)
+    int read_count;      // How many participants have read it
+    pid_t readers[10];   // PIDs of participants who have read it
+    int valid;           // Whether this slot is active
 } Message;
 ```
 
-#### Dialog (Διάλογος)
+**`Dialog`** — a named conversation between processes:
 ```c
 typedef struct {
-    int dialog_id;              // Αναγνωριστικό διαλόγου
-    int process_count;          // Αριθμός συμμετεχόντων
-    pid_t processes[10];        // PIDs συμμετεχόντων
-    int active;                 // Κατάσταση διαλόγου
-    int terminated;             // Σημαία τερματισμού
+    int dialog_id;         // Unique dialog identifier
+    int process_count;     // Number of active participants
+    pid_t processes[10];   // PIDs of participants
+    int active;            // Whether dialog is active
+    int terminated;        // Set when TERMINATE is sent
 } Dialog;
 ```
 
-#### SharedMemory (Κοινόχρηστη Μνήμη)
+**`SharedMemory`** — the full shared memory layout:
 ```c
 typedef struct {
-    Dialog dialogs[10];         // Πίνακας διαλόγων
-    Message messages[50];       // Πίνακας μηνυμάτων
-    int initialized;            // Κατάσταση αρχικοποίησης
+    Dialog dialogs[10];    // Up to 10 concurrent dialogs
+    Message messages[50];  // Up to 50 messages in flight
+    int initialized;       // Init flag
 } SharedMemory;
 ```
 
-### 2.2 Όρια Συστήματος
+### System Limits
 
-| Παράμετρος | Τιμή |
-|------------|------|
-| Μέγιστος αριθμός διαλόγων | 10 |
-| Μέγιστες διεργασίες ανά διάλογο | 10 |
-| Μέγιστος αριθμός μηνυμάτων | 50 |
-| Μέγιστο μήκος μηνύματος | 256 χαρακτήρες |
-
----
-
-## 3. Μηχανισμοί IPC
-
-### 3.1 Κοινόχρηστη Μνήμη (POSIX Shared Memory)
-
-Χρησιμοποιούνται οι ακόλουθες κλήσεις συστήματος:
-
-- **`shm_open()`**: Δημιουργία/άνοιγμα τμήματος κοινόχρηστης μνήμης
-- **`ftruncate()`**: Ορισμός μεγέθους κοινόχρηστης μνήμης
-- **`mmap()`**: Αντιστοίχιση μνήμης στον χώρο διευθύνσεων της διεργασίας
-- **`munmap()`**: Αποδέσμευση αντιστοίχισης
-- **`shm_unlink()`**: Διαγραφή τμήματος κοινόχρηστης μνήμης
-
-**Όνομα κοινόχρηστης μνήμης:** `/ipc_dialog_shm`
-
-### 3.2 Σημαφόροι (POSIX Named Semaphores)
-
-Για τον συγχρονισμό πρόσβασης χρησιμοποιείται ένας named semaphore:
-
-- **`sem_open()`**: Δημιουργία/άνοιγμα σημαφόρου
-- **`sem_wait()`**: Αναμονή και κλείδωμα
-- **`sem_post()`**: Απελευθέρωση κλειδώματος
-- **`sem_close()`**: Κλείσιμο σημαφόρου
-- **`sem_unlink()`**: Διαγραφή σημαφόρου
-
-**Όνομα σημαφόρου:** `/ipc_dialog_mutex`
+| Parameter | Value |
+|-----------|-------|
+| Max concurrent dialogs | 10 |
+| Max participants per dialog | 10 |
+| Max messages in flight | 50 |
+| Max message length | 256 characters |
 
 ---
 
-## 4. Λειτουργίες Συστήματος
+## IPC Mechanisms
 
-### 4.1 Αρχικοποίηση (`init_shared_memory`)
+### POSIX Shared Memory
 
-1. Προσπάθεια ανοίγματος υπάρχουσας κοινόχρηστης μνήμης
-2. Αν δεν υπάρχει, δημιουργία νέας
-3. Αντιστοίχιση στον χώρο διευθύνσεων
-4. Δημιουργία/άνοιγμα σημαφόρου mutex
-5. Αρχικοποίηση δομών αν πρόκειται για νέα μνήμη
+| Call | Purpose |
+|------|---------|
+| `shm_open()` | Create or open the shared memory segment |
+| `ftruncate()` | Set the size of the segment |
+| `mmap()` | Map the segment into the process address space |
+| `munmap()` | Unmap on exit |
+| `shm_unlink()` | Delete the segment when the last process exits |
 
-### 4.2 Συμμετοχή σε Διάλογο (`create_or_join_dialog`)
+Shared memory name: `/ipc_dialog_shm`
 
-1. Κλείδωμα mutex
-2. Αναζήτηση υπάρχοντος διαλόγου με το ID
-3. Αν δεν υπάρχει, δημιουργία νέου
-4. Προσθήκη PID διεργασίας στη λίστα συμμετεχόντων
-5. Απελευθέρωση mutex
+### POSIX Named Semaphore
 
-### 4.3 Αποστολή Μηνύματος (`send_message`)
+A single mutex semaphore protects all critical sections:
 
-1. Κλείδωμα mutex
-2. Εύρεση διαλόγου
-3. Εύρεση ελεύθερης θέσης μηνύματος
-4. Αποθήκευση μηνύματος με metadata
-5. Αν είναι "TERMINATE", ενεργοποίηση σημαίας
-6. Απελευθέρωση mutex
+| Call | Purpose |
+|------|---------|
+| `sem_open()` | Create or open the semaphore |
+| `sem_wait()` | Acquire the lock |
+| `sem_post()` | Release the lock |
+| `sem_close()` | Close on exit |
+| `sem_unlink()` | Delete when the last process exits |
 
-### 4.4 Λήψη Μηνυμάτων (`receive_messages`)
-
-1. Κλείδωμα mutex
-2. Σάρωση όλων των μηνυμάτων του διαλόγου
-3. Για κάθε μη-αναγνωσμένο μήνυμα:
-   - Εμφάνιση στον χρήστη
-   - Προσθήκη PID στη λίστα αναγνωστών
-   - Αύξηση μετρητή ανάγνωσης
-4. Αν όλοι διάβασαν, ακύρωση μηνύματος
-5. Απελευθέρωση mutex
-
-### 4.5 Αποχώρηση από Διάλογο (`leave_dialog`)
-
-1. Κλείδωμα mutex
-2. Αφαίρεση PID από λίστα διαλόγου
-3. Αν είναι ο τελευταίος:
-   - Απενεργοποίηση διαλόγου
-   - Καθαρισμός μηνυμάτων
-4. Αν όλοι οι διάλογοι ανενεργοί:
-   - Διαγραφή κοινόχρηστης μνήμης
-   - Διαγραφή σημαφόρου
-5. Απελευθέρωση mutex
+Semaphore name: `/ipc_dialog_mutex`
 
 ---
 
-## 5. Διαχείριση Χρήστη (main.c)
+## How It Works
 
-### 5.1 Διαθέσιμες Εντολές
+### Joining a Dialog
+1. Lock mutex
+2. Search for an existing dialog with the given ID
+3. If none exists, create a new one
+4. Add the calling process's PID to the participant list
+5. Release mutex
 
-| Εντολή | Περιγραφή |
-|--------|-----------|
-| `JOIN <id>` | Συμμετοχή σε διάλογο με το συγκεκριμένο ID |
-| `SEND <msg>` | Αποστολή μηνύματος |
-| `TERMINATE` | Τερματισμός διαλόγου για όλους |
-| `QUIT` / `EXIT` | Έξοδος από το πρόγραμμα |
-| `HELP` | Εμφάνιση βοήθειας |
+### Sending a Message
+1. Lock mutex
+2. Find the dialog
+3. Find a free message slot
+4. Store the message with sender PID and metadata
+5. If the message is `"TERMINATE"`, set the termination flag
+6. Release mutex
 
-### 5.2 Κύριος Βρόχος
+### Receiving Messages
+1. Lock mutex
+2. Scan all messages belonging to this dialog
+3. For each unread message (PID not in `readers[]`):
+   - Display it to the user
+   - Add PID to `readers[]`, increment `read_count`
+4. If `read_count` equals participant count → mark message invalid (auto-cleanup)
+5. Release mutex
 
-Το πρόγραμμα χρησιμοποιεί `select()` με timeout για:
-- Non-blocking έλεγχο νέων μηνυμάτων (κάθε 100ms)
-- Ταυτόχρονη αναμονή εισόδου χρήστη
-
-### 5.3 Χειρισμός Σημάτων
-
-Υλοποιείται handler για `SIGINT` (Ctrl+C) που επιτρέπει graceful shutdown.
-
----
-
-## 6. Συγχρονισμός και Ασφάλεια
-
-### 6.1 Αμοιβαίος Αποκλεισμός
-
-Κάθε λειτουργία που τροποποιεί την κοινόχρηστη μνήμη περικλείεται σε:
-```c
-sem_wait(mutex);
-// Κρίσιμη περιοχή
-sem_post(mutex);
-```
-
-### 6.2 Εγγύηση Παράδοσης Μηνυμάτων
-
-- Κάθε μήνυμα διαβάζεται ακριβώς μία φορά από κάθε διεργασία
-- Ο μετρητής `read_count` παρακολουθεί πόσοι διάβασαν
-- Το μήνυμα διαγράφεται μόνο όταν όλοι το διαβάσουν
-
-### 6.3 Αυτόματος Καθαρισμός
-
-- Τα μηνύματα αφαιρούνται αυτόματα μετά την ανάγνωση
-- Η κοινόχρηστη μνήμη διαγράφεται όταν φύγει ο τελευταίος
+### Leaving a Dialog
+1. Lock mutex
+2. Remove PID from participant list
+3. If last participant: deactivate dialog, clear its messages
+4. If all dialogs inactive: `shm_unlink` + `sem_unlink`
+5. Release mutex
 
 ---
 
-## 7. Μεταγλώττιση και Εκτέλεση
+## Commands
 
-### 7.1 Μεταγλώττιση
-```bash
-make
-```
+| Command | Description |
+|---------|-------------|
+| `JOIN <id>` | Join or create a dialog with the given numeric ID |
+| `SEND <message>` | Send a message to everyone in the current dialog |
+| `TERMINATE` | Signal all participants to end the dialog |
+| `QUIT` / `EXIT` | Leave the dialog and exit cleanly |
+| `HELP` | Show available commands |
 
-### 7.2 Καθαρισμός
-```bash
-make clean
-```
+---
 
-### 7.3 Παράδειγμα Χρήσης
+## Usage Example
+
+Open two terminals and run the program in each:
 
 **Terminal 1:**
 ```bash
 ./dialog
 > JOIN 1
-[Dialog 1] > Hello!
+Joined dialog 1.
+[Dialog 1] > Hello from process 1!
+[Dialog 1] Message from PID 5679: Hi back!
 ```
 
 **Terminal 2:**
 ```bash
 ./dialog
 > JOIN 1
-[Dialog 1] Message from PID 1234: Hello!
+Joined dialog 1.
+[Dialog 1] Message from PID 5678: Hello from process 1!
 [Dialog 1] > Hi back!
 ```
----
-
-## 8. Αρχεία Έργου
-
-| Αρχείο | Περιγραφή |
-|--------|-----------|
-| `main.c` | Κύριο πρόγραμμα και διεπαφή χρήστη |
-| `ipc_dialog.c` | Υλοποίηση λειτουργιών IPC |
-| `ipc_dialog.h` | Δηλώσεις δομών και συναρτήσεων |
-| `Makefile` | Αρχείο μεταγλώττισης |
-| `README.md` | Οδηγίες χρήσης  |
 
 ---
+
+## Build & Run
+
+### Requirements
+- Linux (POSIX-compliant)
+- GCC
+- Make
+
+### Build
+```bash
+make
+```
+
+### Run
+```bash
+./dialog
+```
+
+### Clean
+```bash
+make clean
+```
+
+> **Note:** If the program crashes without cleanup, stale shared memory or semaphores may persist. Remove them manually:
+> ```bash
+> rm /dev/shm/ipc_dialog_shm
+> rm /dev/shm/sem.ipc_dialog_mutex
+> ```
+
+---
+
+## Project Structure
+
+```
+.
+├── include/
+│   └── ipc_dialog.h      # Struct definitions and function declarations
+├── src/
+│   ├── main.c            # User interface, command loop, signal handling
+│   └── ipc_dialog.c      # Core IPC logic (join, send, receive, leave)
+├── Makefile
+└── README.md
+```
+
+---
+
+## Synchronization Design
+
+All shared memory operations are wrapped in a mutex critical section:
+
+```c
+sem_wait(mutex);
+// --- critical section ---
+sem_post(mutex);
+```
+
+**Message delivery guarantee:** Each message slot has a `readers[]` array and a `read_count` counter. A process only receives a message if its PID is not already in `readers[]`. Once all participants have read a message, it is invalidated and the slot is freed for reuse.
+
+**No busy-waiting:** The main loop uses `select()` with a 100ms timeout on stdin. This allows the process to check for new messages periodically without blocking user input or spinning the CPU.
+
+---
+
+## License
+
+MIT
